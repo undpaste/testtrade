@@ -15,18 +15,18 @@ export default function TradePage() {
   const [pendingOrder, setPendingOrder] = useState<any>(null);
   const [highVolMode, setHighVolMode] = useState(false);
   
-  // State untuk mencegah "Loading abadi"
   const [isLoading, setIsLoading] = useState(true); 
-  const [authError, setAuthError] = useState(false);
+  const [authError, setAuthError] = useState<string | null>(null);
 
   const router = useRouter();
 
   useEffect(() => {
+    let isMounted = true; // Mencegah memory leak / double render
+
     const load = async () => {
       try {
         const { data: { session } } = await supabase.auth.getSession();
         
-        // Kalau belum login, tendang ke halaman /login
         if (!session) {
           router.push('/login');
           return;
@@ -34,16 +34,34 @@ export default function TradePage() {
 
         const userId = session.user.id;
         
-        // Fetch akun
-        const { data: acc, error: accErr } = await supabase
+        // 1. Coba ambil data akun
+        let { data: acc, error: accErr } = await supabase
           .from('accounts')
           .select('*')
           .eq('user_id', userId)
-          .single();
+          .maybeSingle(); // maybeSingle() tidak akan error kalau datanya kosong
 
-        if (accErr) throw accErr;
+        // 2. Kalau akun kosong (belum dibuat), buat otomatis!
+        if (!acc) {
+          console.log("Akun tidak ditemukan, membuat akun baru $1000...");
+          
+          // Cek dulu profile ada atau nggak
+          const { data: profile } = await supabase.from('profiles').select('*').eq('id', userId).maybeSingle();
+          if (!profile) {
+            await supabase.from('profiles').insert({ id: userId, username: session.user.email?.split('@')[0] });
+          }
 
-        // Fetch order history
+          const { data: newAcc, error: createErr } = await supabase
+            .from('accounts')
+            .insert({ user_id: userId, balance: 1000, equity: 1000 })
+            .select()
+            .single();
+            
+          if (createErr) throw createErr;
+          acc = newAcc;
+        }
+
+        // 3. Ambil orders
         const { data: ord } = await supabase
           .from('orders')
           .select('*')
@@ -51,16 +69,21 @@ export default function TradePage() {
           .order('created_at', { ascending: false })
           .limit(50);
 
-        setAccount(acc);
-        setOrders(ord || []);
-      } catch (err) {
+        if (isMounted) {
+          setAccount(acc);
+          setOrders(ord || []);
+        }
+      } catch (err: any) {
         console.error("Load error:", err);
-        setAuthError(true);
+        if (isMounted) setAuthError(err.message || 'Gagal memuat akun');
       } finally {
-        setIsLoading(false); // Selesai loading (apapun hasilnya)
+        if (isMounted) setIsLoading(false);
       }
     };
+    
     load();
+
+    return () => { isMounted = false; };
   }, [router]);
 
   const handleLogout = async () => {
@@ -68,7 +91,7 @@ export default function TradePage() {
     router.push('/login');
   };
 
-  // 1. Tampilan saat Loading
+  // 1. Tampilan Loading
   if (isLoading) {
     return (
       <div className="min-h-screen bg-[#0B0E11] flex flex-col items-center justify-center text-white">
@@ -78,12 +101,13 @@ export default function TradePage() {
     );
   }
 
-  // 2. Tampilan kalau error
+  // 2. Tampilan Error (kalau Supabase beneran mati / env var salah)
   if (authError || !account) {
     return (
-      <div className="min-h-screen bg-[#0B0E11] flex flex-col items-center justify-center text-white">
+      <div className="min-h-screen bg-[#0B0E11] flex flex-col items-center justify-center text-white p-6">
         <h2 className="text-2xl font-bold text-red-500 mb-2">Gagal memuat akun</h2>
-        <p className="text-gray-400 mb-6">Pastikan database Supabase sudah di-setup dengan benar.</p>
+        <p className="text-gray-400 mb-2">Error: {authError}</p>
+        <p className="text-sm text-gray-500 mb-6">Cek Console browser (F12) untuk detail.</p>
         <button onClick={() => window.location.reload()} className="bg-yellow-500 text-black px-6 py-2 rounded-lg font-bold">
           Coba Lagi
         </button>
@@ -97,26 +121,8 @@ export default function TradePage() {
   }
 
   // 4. Tampilan Utama Trading
-  const submitOrder = async (journal: any) => {
-    try {
-      // Kode order engine kamu tetap di sini...
-      // (Anggap fungsi fetch API /api/order kamu sudah jalan)
-      alert('Order berhasil dieksekusi! (simulasi)');
-      setShowJournal(false);
-    } catch (err: any) {
-      if (err.message.startsWith('REVENGE_TRADING')) {
-        const freeze = err.message.split('FREEZE_UNTIL:')[1];
-        setRevengeFreeze(freeze);
-        setShowJournal(false);
-      } else {
-        alert(err.message);
-      }
-    }
-  };
-
   return (
     <div className="min-h-screen bg-[#0B0E11] text-white">
-      {/* Header */}
       <header className="border-b border-gray-800 px-6 py-3 flex items-center justify-between">
         <div className="flex items-center gap-6">
           <div className="text-xl font-black">TestTrade</div>
@@ -145,7 +151,6 @@ export default function TradePage() {
       </header>
 
       <div className="grid grid-cols-12 gap-4 p-4">
-        {/* Left: Portfolio */}
         <div className="col-span-3 space-y-4">
           <RealMoneyWidget pnlUSD={account.equity - 1000} region="ID" />
           <div className="bg-[#12161C] rounded-xl p-4">
@@ -157,12 +162,10 @@ export default function TradePage() {
           </div>
         </div>
 
-        {/* Center: Chart placeholder */}
         <div className="col-span-6 bg-[#12161C] rounded-xl p-4 min-h-[600px] flex items-center justify-center text-gray-600">
           Chart Component Here
         </div>
 
-        {/* Right: Order form */}
         <div className="col-span-3 bg-[#12161C] rounded-xl p-4">
           <h3 className="font-bold mb-4">Place Order</h3>
           <button
@@ -189,7 +192,10 @@ export default function TradePage() {
       <TradeJournalModal
         open={showJournal}
         onClose={() => setShowJournal(false)}
-        onSubmit={submitOrder}
+        onSubmit={(data) => {
+          alert('Simulasi order berhasil! Cek kode order engine kamu.');
+          setShowJournal(false);
+        }}
         symbol={pendingOrder?.symbol || ''}
         side={pendingOrder?.side || ''}
         qty={pendingOrder?.qty || 0}
