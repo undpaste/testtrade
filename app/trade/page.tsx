@@ -5,10 +5,9 @@ export default function SuperSimpleDebug() {
   const [log, setLog] = useState('Mulai ngecek...');
 
   useEffect(() => {
-    // Fungsi ini cuma jalan SEKALI. Titik.
     async function cekKoneksi() {
       try {
-        const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+        let url = process.env.NEXT_PUBLIC_SUPABASE_URL;
         const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 
         if (!url || !key) {
@@ -16,8 +15,19 @@ export default function SuperSimpleDebug() {
           return;
         }
 
-        // Nembak langsung ke Supabase (tanpa library)
-        const res = await fetch(`${url}/rest/v1/profiles?select=*&limit=1`, {
+        // 1. Hapus trailing slash (/) di akhir URL
+        url = url.replace(/\/$/, '');
+
+        // 2. Hapus /rest/v1 jika sudah ada di URL, biar gak dobel
+        url = url.replace(/\/rest\/v1$/, '');
+
+        // 3. Bentuk URL final yang bersih
+        const finalUrl = `${url}/rest/v1/profiles?select=*&limit=1`;
+
+        // Tampilkan URL yang akan ditembak (untuk debug)
+        setLog(`Menembak ke: ${finalUrl}`);
+
+        const res = await fetch(finalUrl, {
           headers: {
             'apikey': key,
             'Authorization': `Bearer ${key}`
@@ -27,11 +37,9 @@ export default function SuperSimpleDebug() {
         const data = await res.json();
 
         if (!res.ok) {
-          // Kalau Supabase nolak
           setLog(`❌ SUPABASE NOLAK: ${JSON.stringify(data)}`);
         } else {
-          // Kalau sukses
-          setLog(`✅ KONEKSI AMAN! Vercel bisa baca database Supabase. Data sampel: ${JSON.stringify(data)}`);
+          setLog(`✅ KONEKSI AMAN! URL yang ditembak benar. Data sampel: ${JSON.stringify(data)}`);
         }
 
       } catch (err: any) {
@@ -40,11 +48,11 @@ export default function SuperSimpleDebug() {
     }
     
     cekKoneksi();
-  }, []); // <--- Array kosong ini wajib, biar gak infinite loop
+  }, []);
 
   return (
     <div style={{ padding: '40px', background: 'black', color: 'lime', fontFamily: 'monospace', minHeight: '100vh' }}>
-      <h1 style={{ fontSize: '24px', marginBottom: '20px' }}>🔍 TES KONEKSI DARURAT</h1>
+      <h1 style={{ fontSize: '24px', marginBottom: '20px' }}>🔍 TES KONEKSI DARURAT v2</h1>
       <div style={{ background: '#111', padding: '20px', border: '1px solid #333', borderRadius: '8px', wordBreak: 'break-all' }}>
         {log}
       </div>
