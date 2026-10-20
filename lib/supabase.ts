@@ -1,11 +1,15 @@
 import { createBrowserClient } from '@supabase/ssr';
 
-const supabaseUrl =
-  process.env.NEXT_PUBLIC_SUPABASE_URL && /^https?:\/\//.test(process.env.NEXT_PUBLIC_SUPABASE_URL)
-    ? process.env.NEXT_PUBLIC_SUPABASE_URL
-    : 'https://example-project.supabase.co';
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 
-const supabaseAnonKey =
-  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || 'example-anon-key';
+// Fail fast: kalau env vars nggak ada, jangan loading diam-diam.
+// Biarkan error yang jelas muncul.
+if (!supabaseUrl || !supabaseAnonKey) {
+  throw new Error(
+    'Missing Supabase environment variables. ' +
+    'Pastikan NEXT_PUBLIC_SUPABASE_URL dan NEXT_PUBLIC_SUPABASE_ANON_KEY sudah di-set di Vercel.'
+  );
+}
 
 export const supabase = createBrowserClient(supabaseUrl, supabaseAnonKey);
