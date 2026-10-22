@@ -1,134 +1,175 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { createClient } from '@supabase/supabase-js';
-import { placeOrder } from '@/lib/orderEngine';
+import { getMarketSnapshot, MarketAssetClass, MarketType } from '@/lib/marketData';
+import { placeOrder, PaperOrderSide, PaperOrderType } from '@/lib/orderEngine';
+import { TradingAssetClass } from '@/lib/realism';
 
-const HYPERLIQUID_INFO_URL = 'https://api.hyperliquid.xyz/info';
-const sides = ['buy', 'sell'] as const;
+const assetClasses: MarketAssetClass[] = ['crypto', 'stock', 'etf', 'dex'];
+const marketTypes: MarketType[] = ['crypto_spot', 'crypto_perp', 'dex_spot', 'stock', 'etf'];
+const sides: PaperOrderSide[] = ['buy', 'sell'];
+const orderTypes: PaperOrderType[] = ['market', 'limit', 'stop_loss', 'take_profit', 'trailing_stop'];
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-async function getOrderMarketData(symbol: string, side: 'buy' | 'sell') {
-  const [marketResponse, bookResponse] = await Promise.all([
-    fetch(HYPERLIQUID_INFO_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ type: 'metaAndAssetCtxs' }),
-      cache: 'no-store',
-      signal: AbortSignal.timeout(12_000),
-    }),
-    fetch(HYPERLIQUID_INFO_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ type: 'l2Book', coin: symbol }),
-      cache: 'no-store',
-      signal: AbortSignal.timeout(12_000),
-    }),
-  ]);
-  if (!marketResponse.ok || !bookResponse.ok) throw new Error('Live market data is temporarily unavailable');
-
-  const [result, book]: [unknown, { levels?: Array<Array<{ px: string; sz: string }>> }] =
-    await Promise.all([marketResponse.json(), bookResponse.json()]);
-  if (!Array.isArray(result) || !isRecord(result[0]) || !Array.isArray(result[0].universe) || !Array.isArray(result[1])) {
-    throw new Error('Market data provider returned an invalid response');
-  }
-
-  const index = result[0].universe.findIndex((market: unknown) => isRecord(market) && market.name === symbol);
-  const context = result[1][index];
-  if (index < 0 || !isRecord(context)) throw new Error(`Market ${symbol} is not available`);
-
-  const marketPrices: Record<string, number> = {};
-  for (let marketIndex = 0; marketIndex < result[0].universe.length; marketIndex++) {
-    const market = result[0].universe[marketIndex];
-    const marketContext = result[1][marketIndex];
-    if (!isRecord(market) || typeof market.name !== 'string' || !isRecord(marketContext)) continue;
-    const markPrice = Number(marketContext.markPx ?? marketContext.midPx);
-    if (Number.isFinite(markPrice) && markPrice > 0) marketPrices[market.name] = markPrice;
-  }
-  const midpoint = Number(context.midPx ?? context.markPx);
-  const bestPrice = Number(book.levels?.[side === 'buy' ? 1 : 0]?.[0]?.px);
-  const price = Number.isFinite(bestPrice) && bestPrice > 0 ? bestPrice : midpoint;
-  const previousPrice = Number(context.prevDayPx);
-  const volume = Number(context.dayNtlVlm);
-  if (!Number.isFinite(price) || price <= 0 || !Number.isFinite(volume) || volume <= 0) {
-    throw new Error(`Live quote for ${symbol} is not available`);
-  }
-
-  return {
-    price,
-    volume,
-    fundingRate: Number(context.funding ?? 0),
-    marketPrices,
-    volatility: Number.isFinite(previousPrice) && previousPrice > 0
-      ? Math.min(Math.abs((price / previousPrice) - 1), 0.05)
-      : 0,
-  };
+function finitePositive(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0;
 }
 
-export async function POST(req: NextRequest) {
-  const authorization = req.headers.get('authorization');
-  const accessToken = authorization?.match(/^Bearer\s+(.+)$/i)?.[1];
-  if (!accessToken) {
-    return NextResponse.json({ error: 'Authentication required' }, { status: 401 });
-  }
+export async function POST(request: NextRequest) {
+  const accessToken = request.headers.get('authorization')?.match(/^Bearer\s+(.+)$/i)?.[1];
+  if (!accessToken) return NextResponse.json({ error: 'Authentication required' }, { status: 401 });
 
   try {
-    const body: unknown = await req.json();
-    if (!isRecord(body)) {
-      return NextResponse.json({ error: 'Request body must be an object' }, { status: 400 });
-    }
+    const body: unknown = await request.json();
+    if (!isRecord(body)) return NextResponse.json({ error: 'Request body must be an object' }, { status: 400 });
 
-    const { symbol, side, qty, reasonEntry, notes, highVolatilityMode } = body;
+    const { symbol, assetClass, marketType, side, orderType, qty, reasonEntry, notes, highVolatilityMode } = body;
+    const limitPrice = body.limitPrice;
+    const triggerPrice = body.triggerPrice;
+    const trailingPercent = body.trailingPercent;
+    const leverage = body.leverage ?? 1;
+    const poolAddress = body.poolAddress;
+    const network = body.network;
+    const isOco = body.orderType === 'oco';
     if (
-      typeof symbol !== 'string' || !/^[A-Z0-9]{2,20}$/.test(symbol.trim()) ||
-      typeof side !== 'string' || !sides.includes(side as typeof sides[number]) ||
-      typeof qty !== 'number' || !Number.isFinite(qty) || qty <= 0 ||
+      typeof symbol !== 'string' || !/^[A-Z0-9.^=-]{1,20}$/.test(symbol.trim()) ||
+      typeof assetClass !== 'string' || !assetClasses.includes(assetClass as MarketAssetClass) ||
+      typeof marketType !== 'string' || !marketTypes.includes(marketType as MarketType) ||
+      typeof side !== 'string' || !sides.includes(side as PaperOrderSide) ||
+      (!isOco && (typeof orderType !== 'string' || !orderTypes.includes(orderType as PaperOrderType))) ||
+      !finitePositive(qty) ||
       typeof reasonEntry !== 'string' || !reasonEntry.trim() ||
       typeof highVolatilityMode !== 'boolean' ||
-      (notes !== undefined && typeof notes !== 'string')
+      (notes !== undefined && typeof notes !== 'string') ||
+      typeof leverage !== 'number' || !Number.isFinite(leverage) || leverage < 1 || leverage > 20 ||
+      (orderType === 'limit' && !finitePositive(limitPrice)) ||
+      ((orderType === 'stop_loss' || orderType === 'take_profit') && !finitePositive(triggerPrice)) ||
+      (orderType === 'trailing_stop' && (typeof trailingPercent !== 'number' || !Number.isFinite(trailingPercent) || trailingPercent <= 0 || trailingPercent > 50)) ||
+      (isOco && (!finitePositive(body.takeProfitPrice) || !finitePositive(body.stopLossPrice)))
     ) {
       return NextResponse.json({ error: 'Invalid order details' }, { status: 400 });
     }
 
+    if ((assetClass === 'stock' || assetClass === 'etf') && marketType !== assetClass) {
+      return NextResponse.json({ error: 'Asset class and market type do not match' }, { status: 400 });
+    }
+    if (assetClass === 'crypto' && marketType !== 'crypto_perp' && marketType !== 'crypto_spot') {
+      return NextResponse.json({ error: 'Choose a supported crypto market' }, { status: 400 });
+    }
+    if (assetClass === 'dex' && (marketType !== 'dex_spot' || typeof poolAddress !== 'string' || !/^0x[a-fA-F0-9]{40}$/.test(poolAddress))) {
+      return NextResponse.json({ error: 'A valid DEX pool is required' }, { status: 400 });
+    }
+    if ((marketType === 'crypto_spot' || marketType === 'dex_spot') && leverage !== 1) {
+      return NextResponse.json({ error: 'Spot markets do not support leverage' }, { status: 400 });
+    }
+    if ((marketType === 'stock' || marketType === 'etf') && leverage > 2) {
+      return NextResponse.json({ error: 'Equity paper margin is limited to 2×' }, { status: 400 });
+    }
+
     const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
     const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
-    if (!supabaseUrl || !supabaseAnonKey) {
-      throw new Error('Supabase environment variables are not configured');
-    }
+    if (!supabaseUrl || !supabaseAnonKey) throw new Error('Supabase environment variables are not configured');
 
     const supabase = createClient(supabaseUrl, supabaseAnonKey, {
       auth: { autoRefreshToken: false, persistSession: false },
       global: { headers: { Authorization: `Bearer ${accessToken}` } },
     });
     const { data: { user }, error: authError } = await supabase.auth.getUser(accessToken);
-    if (authError || !user) {
-      return NextResponse.json({ error: 'Invalid or expired session' }, { status: 401 });
+    if (authError || !user) return NextResponse.json({ error: 'Invalid or expired session' }, { status: 401 });
+
+    const snapshot = await getMarketSnapshot(
+      assetClass as MarketAssetClass,
+      symbol.trim().toUpperCase(),
+      marketType as MarketType,
+      typeof poolAddress === 'string' ? poolAddress : undefined,
+      typeof network === 'string' ? network : undefined
+    );
+    const book = {
+      bids: snapshot.book.bids.map((level) => ({ px: Number(level.px), sz: Number(level.sz) })),
+      asks: snapshot.book.asks.map((level) => ({ px: Number(level.px), sz: Number(level.sz) })),
+    };
+    const referencePrice = snapshot.market.markPrice;
+    if (
+      (isOco && (
+        side === 'sell'
+          ? !(Number(body.takeProfitPrice) > referencePrice && Number(body.stopLossPrice) < referencePrice)
+          : !(Number(body.takeProfitPrice) < referencePrice && Number(body.stopLossPrice) > referencePrice)
+      )) ||
+      (orderType === 'stop_loss' && (
+        side === 'sell' ? Number(triggerPrice) >= referencePrice : Number(triggerPrice) <= referencePrice
+      )) ||
+      (orderType === 'take_profit' && (
+        side === 'sell' ? Number(triggerPrice) <= referencePrice : Number(triggerPrice) >= referencePrice
+      ))
+    ) {
+      return NextResponse.json({ error: 'Trigger prices must be on the correct side of the current market price' }, { status: 400 });
+    }
+    const common = {
+      userId: user.id,
+      symbol: snapshot.market.symbol,
+      assetClass: assetClass as TradingAssetClass,
+      marketType: marketType as MarketType,
+      side: side as PaperOrderSide,
+      qty,
+      reasonEntry: reasonEntry.trim(),
+      notes: notes as string | undefined,
+      avgDailyVolume: snapshot.market.volume24h,
+      poolLiquidityUsd: snapshot.market.liquidityUsd,
+      recentVolatility: Math.min(Math.abs(snapshot.market.change24hPct / 100), 0.05),
+      fundingRate: snapshot.market.fundingRate,
+      highVolatilityMode,
+      leverage,
+      referencePrice,
+      book,
+      marketSnapshot: {
+        source: snapshot.source,
+        bookSource: snapshot.bookSource,
+        observedAt: snapshot.updatedAt,
+        markPrice: snapshot.market.markPrice,
+        change24hPct: snapshot.market.change24hPct,
+        volume24h: snapshot.market.volume24h,
+        fundingRate: snapshot.market.fundingRate,
+      },
+      poolAddress: snapshot.market.poolAddress,
+      network: snapshot.market.network,
+    };
+
+    if (isOco) {
+      const { data, error } = await supabase.rpc('create_paper_oco_order', {
+        p_user_id: user.id,
+        p_symbol: snapshot.market.symbol,
+        p_asset_class: assetClass,
+        p_market_type: marketType,
+        p_side: side,
+        p_qty: qty,
+        p_reference_price: referencePrice,
+        p_take_profit_price: body.takeProfitPrice,
+        p_stop_loss_price: body.stopLossPrice,
+        p_reason_entry: reasonEntry.trim(),
+        p_notes: typeof notes === 'string' ? notes : null,
+        p_leverage: leverage,
+        p_pool_address: snapshot.market.poolAddress ?? null,
+        p_network: snapshot.market.network ?? null,
+      });
+      if (error) throw error;
+      return NextResponse.json({ pending: true, ...(data as Record<string, unknown>) });
     }
 
-    const market = await getOrderMarketData(symbol.trim(), side as typeof sides[number]);
     const result = await placeOrder({
       supabase,
       input: {
-        userId: user.id,
-        symbol: symbol.trim(),
-        assetClass: 'crypto',
-        side: side as typeof sides[number],
-        orderType: 'market',
-        qty,
-        requestedPrice: market.price,
-        reasonEntry: reasonEntry.trim(),
-        notes: notes as string | undefined,
-        avgDailyVolume: market.volume,
-        marketPrices: market.marketPrices,
-        recentVolatility: market.volatility,
-        fundingRate: market.fundingRate,
-        highVolatilityMode,
+        ...common,
+        orderType: orderType as PaperOrderType,
+        limitPrice: finitePositive(limitPrice) ? limitPrice : undefined,
+        triggerPrice: finitePositive(triggerPrice) ? triggerPrice : undefined,
+        trailingPercent: finitePositive(trailingPercent) ? trailingPercent : undefined,
       },
     });
-    return NextResponse.json(result);
+    return NextResponse.json(result, { status: 201 });
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'Unable to place order';
+    const message = error instanceof Error ? error.message : 'Unable to place paper order';
     return NextResponse.json({ error: message }, { status: 400 });
   }
 }

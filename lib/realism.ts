@@ -1,157 +1,223 @@
-// =====================================================
-// REALITY ENGINE: Slippage, Fees, Partial Fills
-// =====================================================
+export type TradingAssetClass = 'crypto' | 'stock' | 'etf' | 'dex';
+export type TradingMarketType = 'crypto_spot' | 'crypto_perp' | 'dex_spot' | 'stock' | 'etf';
 
-// Fee structure realistic per asset class
 export const FEE_SCHEDULE = {
-  crypto: { maker: 0.00015, taker: 0.00045 },
-  stock:  { maker: 0.0000, taker: 0.0002 },   // commission-free + SEC fee
-  etf:    { maker: 0.0000, taker: 0.0002 },
+  crypto_perp: { maker: 0.00015, taker: 0.00045 },
+  crypto_spot: { maker: 0.001, taker: 0.001 },
+  dex_spot: { maker: 0, taker: 0.003 },
+  stock: { maker: 0, taker: 0 },
+  etf: { maker: 0, taker: 0 },
+} satisfies Record<TradingMarketType, { maker: number; taker: number }>;
+
+export const STOCK_FEE_ASSUMPTIONS = {
+  secSellRate: 0.0000278,
+  finraPerShare: 0.000166,
+  finraCap: 8.3,
+  exchangePerShare: 0.0002,
+  borrowApr: 0.08,
 };
 
-// Slippage distribution calibrated to real exchange data
-export const SLIPPAGE = {
-  normal:   { min: 0.00005, max: 0.0005, typical: 0.00015 },
-  volatile: { min: 0.0005, max: 0.0050, typical: 0.0020 },
+export const DEX_FEE_ASSUMPTIONS = {
+  poolFeeRate: 0.003,
+  gasUnits: 150_000,
+  gasPriceGwei: 20,
+  nativeTokenUsd: 3_000,
 };
+
+export const SLIPPAGE = {
+  normal: { min: 0.00002, max: 0.002, typical: 0.0001 },
+  volatile: { min: 0.0002, max: 0.015, typical: 0.001 },
+};
+
+export interface BookLevel {
+  px: number;
+  sz: number;
+}
 
 export interface OrderContext {
   symbol: string;
-  assetClass: 'crypto' | 'stock' | 'etf';
+  assetClass: TradingAssetClass;
+  marketType?: TradingMarketType;
   side: 'buy' | 'sell';
   orderType: 'market' | 'limit';
   qty: number;
   requestedPrice: number;
-  avgDailyVolume: number;    // in USD terms
+  avgDailyVolume: number;
   highVolatilityMode: boolean;
-  recentVolatility: number;  // 0-1, scaled
+  recentVolatility: number;
+  book?: { bids: BookLevel[]; asks: BookLevel[] };
+  poolLiquidityUsd?: number;
+  makerMode?: boolean;
+  gasPriceGwei?: number;
+  nativeTokenUsd?: number;
+}
+
+export interface FeeBreakdown {
+  tradingFee: number;
+  regulatoryFee: number;
+  exchangeFee: number;
+  poolFee: number;
+  gasFee: number;
+  borrowFee: number;
+  total: number;
+  currency: string;
+  maker: boolean;
 }
 
 export interface FillResult {
   fillPrice: number;
   filledQty: number;
   requestedQty: number;
-  fillRatio: number;         // 0-1
+  fillRatio: number;
   slippagePct: number;
   fee: number;
   feeTaker: boolean;
   partial: boolean;
+  feeBreakdown: FeeBreakdown;
+  executionLatencyMs: number;
 }
 
-// =====================================================
-// SLIPPAGE MODEL
-// =====================================================
+export function getMarketType(ctx: Pick<OrderContext, 'assetClass' | 'marketType'>): TradingMarketType {
+  if (ctx.marketType) return ctx.marketType;
+  if (ctx.assetClass === 'stock' || ctx.assetClass === 'etf' || ctx.assetClass === 'dex') return ctx.assetClass === 'dex' ? 'dex_spot' : ctx.assetClass;
+  return 'crypto_perp';
+}
+
 export function calculateSlippage(ctx: OrderContext): number {
   const schedule = ctx.highVolatilityMode ? SLIPPAGE.volatile : SLIPPAGE.normal;
-
-  // Base slippage: skewed toward typical
-  const base = schedule.typical;
-
-  // Size impact: bigger orders slip more
-  const orderValueUSD = ctx.qty * ctx.requestedPrice;
-  const sizeRatio = orderValueUSD / Math.max(ctx.avgDailyVolume, 1);
-  // Impact grows sub-linearly: sqrt-like curve
-  const sizeImpact = Math.sqrt(Math.min(sizeRatio, 0.5)) * 0.5;
-
-  // Volatility impact
-  const volImpact = ctx.recentVolatility * 0.3;
-
-  // Random component (market microstructure is noisy)
-  const noise = (Math.random() - 0.5) * (schedule.max - schedule.min);
-
-  let slippage = base + sizeImpact + volImpact + noise;
-  slippage = Math.max(schedule.min, Math.min(schedule.max, slippage));
-
-  return slippage;
+  const notional = ctx.qty * ctx.requestedPrice;
+  const liquidityRatio = notional / Math.max(ctx.avgDailyVolume, 1);
+  const impact = Math.min(0.05, 0.1 * Math.sqrt(Math.max(0, liquidityRatio)));
+  const volatilityImpact = Math.min(schedule.max, Math.max(0, ctx.recentVolatility) * 0.1);
+  const randomSpread = Math.random() * (schedule.max - schedule.min);
+  return Math.max(schedule.min, Math.min(schedule.max, schedule.typical + impact + volatilityImpact + randomSpread));
 }
 
-// =====================================================
-// PARTIAL FILL MODEL
-// =====================================================
-export function calculateFillRatio(ctx: OrderContext): number {
-  const orderValueUSD = ctx.qty * ctx.requestedPrice;
-  const sizeRatio = orderValueUSD / Math.max(ctx.avgDailyVolume, 1);
-
-  // Orders > 0.5% of ADV start showing partial fills
-  if (sizeRatio < 0.005) return 1.0;
-
-  // Model: fill ratio decays with size
-  // 1% of ADV -> ~90% fill
-  // 5% of ADV -> ~50% fill
-  // 10%+ of ADV -> ~25% fill
-  const baseRatio = 1 / (1 + sizeRatio * 15);
-
-  // Add randomness
-  const noise = (Math.random() - 0.5) * 0.15;
-  const ratio = baseRatio + noise;
-
-  return Math.max(0.15, Math.min(1.0, ratio));
-}
-
-// =====================================================
-// FEE MODEL
-// =====================================================
 export function calculateFee(
   ctx: OrderContext,
   fillPrice: number,
   filledQty: number,
-  makerMode: boolean = false
-): { fee: number; taker: boolean } {
-  const schedule = FEE_SCHEDULE[ctx.assetClass];
-  const isTaker = ctx.orderType === 'market' || !makerMode;
-  const rate = isTaker ? schedule.taker : schedule.maker;
+  makerMode = false
+): FeeBreakdown {
+  const marketType = getMarketType(ctx);
   const notional = fillPrice * filledQty;
-  return { fee: notional * rate, taker: isTaker };
+  const schedule = FEE_SCHEDULE[marketType];
+  const tradingFee = notional * (makerMode ? schedule.maker : schedule.taker);
+  const isSell = ctx.side === 'sell';
+  const regulatoryFee = marketType === 'stock' || marketType === 'etf'
+    ? (isSell ? notional * STOCK_FEE_ASSUMPTIONS.secSellRate : 0) +
+      (isSell ? Math.min(filledQty * STOCK_FEE_ASSUMPTIONS.finraPerShare, STOCK_FEE_ASSUMPTIONS.finraCap) : 0)
+    : 0;
+  const exchangeFee = marketType === 'stock' || marketType === 'etf'
+    ? (isSell ? filledQty * STOCK_FEE_ASSUMPTIONS.exchangePerShare : 0)
+    : 0;
+  const poolFee = marketType === 'dex_spot' ? notional * DEX_FEE_ASSUMPTIONS.poolFeeRate : 0;
+  const gasPriceGwei = ctx.gasPriceGwei ?? DEX_FEE_ASSUMPTIONS.gasPriceGwei;
+  const nativeTokenUsd = ctx.nativeTokenUsd ?? DEX_FEE_ASSUMPTIONS.nativeTokenUsd;
+  const gasFee = marketType === 'dex_spot'
+    ? DEX_FEE_ASSUMPTIONS.gasUnits * gasPriceGwei * 1e-9 * nativeTokenUsd
+    : 0;
+  const borrowFee = ctx.side === 'sell' && (marketType === 'stock' || marketType === 'etf')
+    ? notional * STOCK_FEE_ASSUMPTIONS.borrowApr / (365 * 24)
+    : 0;
+
+  return {
+    tradingFee,
+    regulatoryFee,
+    exchangeFee,
+    poolFee,
+    gasFee,
+    borrowFee,
+    total: tradingFee + regulatoryFee + exchangeFee + poolFee + gasFee + borrowFee,
+    currency: marketType === 'crypto_spot' ? 'USDT' : 'USD',
+    maker: makerMode,
+  };
 }
 
-// =====================================================
-// MAIN: EXECUTE ORDER WITH REALISM
-// =====================================================
+export function calculateFillRatio(ctx: OrderContext): number {
+  const notional = ctx.qty * ctx.requestedPrice;
+  const participation = notional / Math.max(ctx.avgDailyVolume, 1);
+  const modeledCapacity = Math.max(0.1, Math.min(1, 1 / (1 + Math.sqrt(participation) * 12)));
+  return Math.max(0.1, Math.min(1, modeledCapacity - Math.random() * 0.04));
+}
+
+function fillAgainstBook(ctx: OrderContext, requestedQty: number): { quantity: number; averagePrice: number } | null {
+  const levels = ctx.side === 'buy' ? ctx.book?.asks : ctx.book?.bids;
+  if (!levels?.length) return null;
+
+  let remaining = requestedQty;
+  let notional = 0;
+  let filled = 0;
+  for (const level of levels) {
+    if (remaining <= 0) break;
+    if (!(level.px > 0) || !(level.sz > 0)) continue;
+    if (ctx.orderType === 'limit' && (
+      (ctx.side === 'buy' && level.px > ctx.requestedPrice) ||
+      (ctx.side === 'sell' && level.px < ctx.requestedPrice)
+    )) break;
+    const quantity = Math.min(remaining, level.sz);
+    remaining -= quantity;
+    filled += quantity;
+    notional += quantity * level.px;
+  }
+  return filled > 0 ? { quantity: filled, averagePrice: notional / filled } : { quantity: 0, averagePrice: ctx.requestedPrice };
+}
+
 export function simulateFill(ctx: OrderContext): FillResult {
-  // 1. Compute slippage
-  const slippagePct = calculateSlippage(ctx);
-
-  // 2. Apply slippage directionally
-  // Buy: worse = higher price. Sell: worse = lower price.
-  const direction = ctx.side === 'buy' ? 1 : -1;
-  let fillPrice = ctx.requestedPrice * (1 + direction * slippagePct);
-
-  // For limit orders: only fill if price crosses limit
-  if (ctx.orderType === 'limit') {
-    const limit = ctx.requestedPrice;
-    if (ctx.side === 'buy' && fillPrice > limit) {
-      // Price moved away from limit — no fill
-      return {
-        fillPrice: limit, filledQty: 0, requestedQty: ctx.qty,
-        fillRatio: 0, slippagePct: 0, fee: 0, feeTaker: false, partial: false,
-      };
-    }
-    if (ctx.side === 'sell' && fillPrice < limit) {
-      return {
-        fillPrice: limit, filledQty: 0, requestedQty: ctx.qty,
-        fillRatio: 0, slippagePct: 0, fee: 0, feeTaker: false, partial: false,
-      };
-    }
-    // For limit orders, no slippage (you get your limit or better)
-    fillPrice = limit;
+  if (getMarketType(ctx) === 'dex_spot' && (ctx.poolLiquidityUsd ?? 0) > 0) {
+    const reserveQuote = Number(ctx.poolLiquidityUsd) / 2;
+    const reserveBase = reserveQuote / ctx.requestedPrice;
+    const filledQty = Math.min(ctx.qty, reserveBase * 0.95);
+    const quoteAmount = ctx.side === 'buy'
+      ? (reserveQuote * filledQty) / Math.max(reserveBase - filledQty, reserveBase * 0.05)
+      : (reserveQuote * filledQty) / (reserveBase + filledQty);
+    const fillPrice = quoteAmount / Math.max(filledQty, Number.EPSILON);
+    const slippagePct = Math.abs(fillPrice - ctx.requestedPrice) / ctx.requestedPrice;
+    const feeBreakdown = calculateFee(ctx, fillPrice, filledQty, false);
+    return {
+      fillPrice,
+      filledQty,
+      requestedQty: ctx.qty,
+      fillRatio: ctx.qty ? filledQty / ctx.qty : 0,
+      slippagePct,
+      fee: feeBreakdown.total,
+      feeTaker: true,
+      partial: filledQty < ctx.qty * 0.999,
+      feeBreakdown,
+      executionLatencyMs: Math.round(350 + Math.random() * 1_200),
+    };
   }
 
-  // 3. Compute fill ratio (partial fills)
-  const fillRatio = ctx.orderType === 'market' ? calculateFillRatio(ctx) : 1.0;
-  const filledQty = ctx.qty * fillRatio;
-
-  // 4. Compute fees
-  const makerMode = ctx.orderType === 'limit';
-  const { fee, taker } = calculateFee(ctx, fillPrice, filledQty, makerMode);
+  const depthFill = fillAgainstBook(ctx, ctx.qty);
+  const schedule = ctx.highVolatilityMode ? SLIPPAGE.volatile : SLIPPAGE.normal;
+  const slippagePct = depthFill
+    ? Math.abs(depthFill.averagePrice - ctx.requestedPrice) / ctx.requestedPrice
+    : calculateSlippage(ctx);
+  const fillRatio = depthFill
+    ? depthFill.quantity / ctx.qty
+    : ctx.orderType === 'market' ? calculateFillRatio(ctx) : 1;
+  const filledQty = ctx.orderType === 'limit' && !depthFill
+    ? 0
+    : ctx.orderType === 'market' && !depthFill
+      ? ctx.qty * fillRatio
+      : depthFill?.quantity ?? ctx.qty * fillRatio;
+  const direction = ctx.side === 'buy' ? 1 : -1;
+  const rawFillPrice = depthFill?.averagePrice ?? ctx.requestedPrice * (1 + direction * slippagePct);
+  const fillPrice = ctx.orderType === 'limit' && !depthFill
+    ? ctx.requestedPrice
+    : Math.max(ctx.requestedPrice * (1 - schedule.max), Math.min(ctx.requestedPrice * (1 + schedule.max), rawFillPrice));
+  const feeBreakdown = calculateFee(ctx, fillPrice, filledQty, ctx.makerMode ?? false);
 
   return {
     fillPrice,
     filledQty,
     requestedQty: ctx.qty,
-    fillRatio,
-    slippagePct: ctx.orderType === 'market' ? slippagePct : 0,
-    fee,
-    feeTaker: taker,
-    partial: fillRatio < 0.99,
+    fillRatio: ctx.qty > 0 ? filledQty / ctx.qty : 0,
+    slippagePct: ctx.orderType === 'limit' ? 0 : slippagePct,
+    fee: feeBreakdown.total,
+    feeTaker: !feeBreakdown.maker,
+    partial: filledQty < ctx.qty * 0.999,
+    feeBreakdown,
+    executionLatencyMs: Math.round(35 + Math.random() * 125),
   };
 }
