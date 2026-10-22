@@ -36,7 +36,7 @@ export function isAccountDead(account: {
   }
 
   // Check fresh blow-up
-  if (account.equity <= 0 && !account.is_dead) {
+  if (account.balance <= 0 && !account.is_dead) {
     const deadUntil = new Date();
     deadUntil.setDate(deadUntil.getDate() + ACCOUNT_DEATH_DAYS);
     return {
