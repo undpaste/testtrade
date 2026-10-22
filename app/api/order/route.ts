@@ -2,12 +2,68 @@ import { NextRequest, NextResponse } from 'next/server';
 import { createClient } from '@supabase/supabase-js';
 import { placeOrder } from '@/lib/orderEngine';
 
-const assetClasses = ['crypto', 'stock', 'etf'] as const;
+const HYPERLIQUID_INFO_URL = 'https://api.hyperliquid.xyz/info';
 const sides = ['buy', 'sell'] as const;
-const orderTypes = ['market', 'limit'] as const;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+async function getOrderMarketData(symbol: string, side: 'buy' | 'sell') {
+  const [marketResponse, bookResponse] = await Promise.all([
+    fetch(HYPERLIQUID_INFO_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'metaAndAssetCtxs' }),
+      cache: 'no-store',
+      signal: AbortSignal.timeout(12_000),
+    }),
+    fetch(HYPERLIQUID_INFO_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'l2Book', coin: symbol }),
+      cache: 'no-store',
+      signal: AbortSignal.timeout(12_000),
+    }),
+  ]);
+  if (!marketResponse.ok || !bookResponse.ok) throw new Error('Live market data is temporarily unavailable');
+
+  const [result, book]: [unknown, { levels?: Array<Array<{ px: string; sz: string }>> }] =
+    await Promise.all([marketResponse.json(), bookResponse.json()]);
+  if (!Array.isArray(result) || !isRecord(result[0]) || !Array.isArray(result[0].universe) || !Array.isArray(result[1])) {
+    throw new Error('Market data provider returned an invalid response');
+  }
+
+  const index = result[0].universe.findIndex((market: unknown) => isRecord(market) && market.name === symbol);
+  const context = result[1][index];
+  if (index < 0 || !isRecord(context)) throw new Error(`Market ${symbol} is not available`);
+
+  const marketPrices: Record<string, number> = {};
+  for (let marketIndex = 0; marketIndex < result[0].universe.length; marketIndex++) {
+    const market = result[0].universe[marketIndex];
+    const marketContext = result[1][marketIndex];
+    if (!isRecord(market) || typeof market.name !== 'string' || !isRecord(marketContext)) continue;
+    const markPrice = Number(marketContext.markPx ?? marketContext.midPx);
+    if (Number.isFinite(markPrice) && markPrice > 0) marketPrices[market.name] = markPrice;
+  }
+  const midpoint = Number(context.midPx ?? context.markPx);
+  const bestPrice = Number(book.levels?.[side === 'buy' ? 1 : 0]?.[0]?.px);
+  const price = Number.isFinite(bestPrice) && bestPrice > 0 ? bestPrice : midpoint;
+  const previousPrice = Number(context.prevDayPx);
+  const volume = Number(context.dayNtlVlm);
+  if (!Number.isFinite(price) || price <= 0 || !Number.isFinite(volume) || volume <= 0) {
+    throw new Error(`Live quote for ${symbol} is not available`);
+  }
+
+  return {
+    price,
+    volume,
+    fundingRate: Number(context.funding ?? 0),
+    marketPrices,
+    volatility: Number.isFinite(previousPrice) && previousPrice > 0
+      ? Math.min(Math.abs((price / previousPrice) - 1), 0.05)
+      : 0,
+  };
 }
 
 export async function POST(req: NextRequest) {
@@ -23,18 +79,12 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: 'Request body must be an object' }, { status: 400 });
     }
 
-    const { symbol, assetClass, side, orderType, qty, requestedPrice, reasonEntry } = body;
-    const { notes, avgDailyVolume, recentVolatility, highVolatilityMode } = body;
+    const { symbol, side, qty, reasonEntry, notes, highVolatilityMode } = body;
     if (
-      typeof symbol !== 'string' || !symbol.trim() ||
-      typeof assetClass !== 'string' || !assetClasses.includes(assetClass as typeof assetClasses[number]) ||
+      typeof symbol !== 'string' || !/^[A-Z0-9]{2,20}$/.test(symbol.trim()) ||
       typeof side !== 'string' || !sides.includes(side as typeof sides[number]) ||
-      typeof orderType !== 'string' || !orderTypes.includes(orderType as typeof orderTypes[number]) ||
       typeof qty !== 'number' || !Number.isFinite(qty) || qty <= 0 ||
-      typeof requestedPrice !== 'number' || !Number.isFinite(requestedPrice) || requestedPrice <= 0 ||
       typeof reasonEntry !== 'string' || !reasonEntry.trim() ||
-      typeof avgDailyVolume !== 'number' || !Number.isFinite(avgDailyVolume) || avgDailyVolume <= 0 ||
-      typeof recentVolatility !== 'number' || !Number.isFinite(recentVolatility) || recentVolatility < 0 || recentVolatility > 1 ||
       typeof highVolatilityMode !== 'boolean' ||
       (notes !== undefined && typeof notes !== 'string')
     ) {
@@ -56,20 +106,23 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: 'Invalid or expired session' }, { status: 401 });
     }
 
+    const market = await getOrderMarketData(symbol.trim(), side as typeof sides[number]);
     const result = await placeOrder({
       supabase,
       input: {
         userId: user.id,
         symbol: symbol.trim(),
-        assetClass: assetClass as typeof assetClasses[number],
+        assetClass: 'crypto',
         side: side as typeof sides[number],
-        orderType: orderType as typeof orderTypes[number],
+        orderType: 'market',
         qty,
-        requestedPrice,
+        requestedPrice: market.price,
         reasonEntry: reasonEntry.trim(),
         notes: notes as string | undefined,
-        avgDailyVolume,
-        recentVolatility,
+        avgDailyVolume: market.volume,
+        marketPrices: market.marketPrices,
+        recentVolatility: market.volatility,
+        fundingRate: market.fundingRate,
         highVolatilityMode,
       },
     });

@@ -4,15 +4,15 @@
 
 // Fee structure realistic per asset class
 export const FEE_SCHEDULE = {
-  crypto: { maker: 0.0008, taker: 0.0010 },   // Binance-like
+  crypto: { maker: 0.00015, taker: 0.00045 },
   stock:  { maker: 0.0000, taker: 0.0002 },   // commission-free + SEC fee
   etf:    { maker: 0.0000, taker: 0.0002 },
 };
 
 // Slippage distribution calibrated to real exchange data
 export const SLIPPAGE = {
-  normal:   { min: 0.0005, max: 0.0020, typical: 0.0010 }, // 0.05-0.20%
-  volatile: { min: 0.0020, max: 0.0150, typical: 0.0050 }, // 0.20-1.50%
+  normal:   { min: 0.00005, max: 0.0005, typical: 0.00015 },
+  volatile: { min: 0.0005, max: 0.0050, typical: 0.0020 },
 };
 
 export interface OrderContext {

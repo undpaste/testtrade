@@ -13,7 +13,9 @@ type PlaceOrderInput = {
   reasonEntry: string;
   notes?: string;
   avgDailyVolume: number;
+  marketPrices: Record<string, number>;
   recentVolatility: number;
+  fundingRate: number;
   highVolatilityMode: boolean;
 };
 
@@ -21,13 +23,11 @@ export async function placeOrder({ supabase, input }: {
   supabase: SupabaseClient;
   input: PlaceOrderInput;
 }) {
-  // ============ CHECK 1: Account death lockout ============
   const { data: account, error: accountError } = await supabase
     .from('accounts')
     .select('*')
     .eq('user_id', input.userId)
     .single();
-
   if (accountError) throw accountError;
   if (!account) throw new Error('Account not found');
 
@@ -45,11 +45,8 @@ export async function placeOrder({ supabase, input }: {
     .limit(1)
     .maybeSingle();
   if (freezeError) throw freezeError;
-  if (activeFreeze) {
-    throw new Error(`Trading is frozen until ${activeFreeze.frozen_until}.`);
-  }
+  if (activeFreeze) throw new Error(`Trading is frozen until ${activeFreeze.frozen_until}.`);
 
-  // ============ CHECK 2: Revenge trading ============
   const { data: recentJournalEntries, error: journalQueryError } = await supabase
     .from('journal')
     .select('id, user_id, symbol, side, qty, entry_price, pnl, created_at')
@@ -70,10 +67,7 @@ export async function placeOrder({ supabase, input }: {
   });
 
   if (revenge.triggered) {
-    const frozenUntil = new Date();
-    frozenUntil.setMinutes(frozenUntil.getMinutes() + REVENGE_FREEZE_MIN);
-
-    // Log event + freeze
+    const frozenUntil = new Date(Date.now() + REVENGE_FREEZE_MIN * 60_000);
     const { error: revengeError } = await supabase.from('revenge_events').insert({
       user_id: input.userId,
       loss_amount: revenge.lossAmount,
@@ -81,11 +75,9 @@ export async function placeOrder({ supabase, input }: {
       frozen_until: frozenUntil.toISOString(),
     });
     if (revengeError) throw revengeError;
-
     throw new Error(`REVENGE_TRADING:${revenge.reason}||FREEZE_UNTIL:${frozenUntil.toISOString()}`);
   }
 
-  // ============ REALISM ENGINE ============
   const ctx: OrderContext = {
     symbol: input.symbol,
     assetClass: input.assetClass,
@@ -97,56 +89,42 @@ export async function placeOrder({ supabase, input }: {
     highVolatilityMode: input.highVolatilityMode,
     recentVolatility: input.recentVolatility,
   };
-
   const fill = simulateFill(ctx);
-  let openPosition: {
-    id: string;
-    qty: number;
-    avg_entry: number;
-    realized_pnl: number;
-  } | null = null;
 
-  if (input.side === 'sell' && fill.filledQty > 0) {
-    const { data: position, error: positionError } = await supabase
-      .from('positions')
-      .select('id, qty, avg_entry, realized_pnl')
-      .eq('user_id', input.userId)
-      .eq('symbol', input.symbol)
-      .is('closed_at', null)
-      .maybeSingle();
+  const { data: existingPosition, error: positionQueryError } = await supabase
+    .from('positions')
+    .select('id, qty, avg_entry, realized_pnl, opened_at')
+    .eq('user_id', input.userId)
+    .eq('symbol', input.symbol)
+    .is('closed_at', null)
+    .maybeSingle();
+  if (positionQueryError) throw positionQueryError;
 
-    if (positionError) throw positionError;
-    if (!position || Number(position.qty) + 1e-8 < fill.filledQty) {
-      throw new Error(`Not enough ${input.symbol} in your paper portfolio to sell that quantity.`);
-    }
+  const oldQty = Number(existingPosition?.qty ?? 0);
+  const oldEntry = Number(existingPosition?.avg_entry ?? 0);
+  const signedOrderQty = input.side === 'buy' ? fill.filledQty : -fill.filledQty;
+  const newQty = oldQty + signedOrderQty;
+  const closesExisting = oldQty !== 0 && Math.sign(oldQty) !== Math.sign(signedOrderQty);
+  const closingQty = closesExisting ? Math.min(Math.abs(oldQty), fill.filledQty) : 0;
+  const openingQty = fill.filledQty - closingQty;
+  const realizedBeforeFunding = closingQty > 0
+    ? (fill.fillPrice - oldEntry) * closingQty * Math.sign(oldQty)
+    : 0;
+  const fundingPeriods = existingPosition
+    ? Math.max(0, Math.floor(Date.now() / 28_800_000) - Math.floor(new Date(existingPosition.opened_at).getTime() / 28_800_000))
+    : 0;
+  const fundingPayment = closingQty * oldEntry * input.fundingRate * fundingPeriods * Math.sign(oldQty);
+  const realizedPnl = realizedBeforeFunding - fundingPayment;
 
-    openPosition = {
-      id: position.id,
-      qty: Number(position.qty),
-      avg_entry: Number(position.avg_entry),
-      realized_pnl: Number(position.realized_pnl ?? 0),
-    };
-  }
-
-  // ============ UPDATE ACCOUNT ============
-  const orderValue = fill.fillPrice * fill.filledQty;
+  const marginReleased = closingQty * oldEntry;
+  const marginRequired = openingQty * fill.fillPrice;
   const feeTotal = fill.fee;
-
-  let newBalance = Number(account.balance);
-  const newFees = Number(account.total_fees_paid ?? 0) + feeTotal;
-
-  if (input.side === 'buy') {
-    const totalCost = orderValue + feeTotal;
-    if (totalCost > newBalance) {
-      throw new Error('Insufficient balance (including slippage + fees)');
-    }
-    newBalance -= totalCost;
-  } else {
-    newBalance += orderValue - feeTotal;
+  const newBalance = Number(account.balance) + marginReleased + realizedPnl - marginRequired - feeTotal;
+  if (newBalance < -1e-8) {
+    throw new Error('Insufficient available paper balance for margin and fees.');
   }
 
-  // ============ PERSIST ============
-  const { data: order, error: orderErr } = await supabase.from('orders').insert({
+  const { data: order, error: orderError } = await supabase.from('orders').insert({
     user_id: input.userId,
     symbol: input.symbol,
     asset_class: input.assetClass,
@@ -162,63 +140,43 @@ export async function placeOrder({ supabase, input }: {
     reason_entry: input.reasonEntry,
     notes: input.notes,
   }).select().single();
-
-  if (orderErr) throw orderErr;
+  if (orderError) throw orderError;
 
   if (fill.filledQty > 0) {
-    if (input.side === 'buy') {
-      const { data: position, error: positionQueryError } = await supabase
-        .from('positions')
-        .select('id, qty, avg_entry, realized_pnl')
-        .eq('user_id', input.userId)
-        .eq('symbol', input.symbol)
-        .is('closed_at', null)
-        .maybeSingle();
-      if (positionQueryError) throw positionQueryError;
+    const remainsOldDirection = oldQty !== 0 && newQty !== 0 && Math.sign(oldQty) === Math.sign(newQty);
+    const addsToPosition = oldQty !== 0 && Math.sign(oldQty) === Math.sign(signedOrderQty);
+    const avgEntry = remainsOldDirection && !addsToPosition
+      ? oldEntry
+      : addsToPosition
+        ? (Math.abs(oldQty) * oldEntry + fill.filledQty * fill.fillPrice) / Math.abs(newQty)
+        : fill.fillPrice;
+    const closed = Math.abs(newQty) < 1e-8;
+    const positionValues = {
+      qty: closed ? 0 : newQty,
+      avg_entry: avgEntry,
+      realized_pnl: Number(existingPosition?.realized_pnl ?? 0) + realizedPnl,
+      closed_at: closed ? new Date().toISOString() : null,
+      ...(existingPosition && oldQty !== 0 && Math.sign(oldQty) !== Math.sign(newQty)
+        ? { opened_at: new Date().toISOString() }
+        : {}),
+    };
 
-      if (position) {
-        const oldQty = Number(position.qty);
-        const newQty = oldQty + fill.filledQty;
-        const avgEntry = (
-          oldQty * Number(position.avg_entry) + fill.filledQty * fill.fillPrice
-        ) / newQty;
-        const { error: positionUpdateError } = await supabase
-          .from('positions')
-          .update({ qty: newQty, avg_entry: avgEntry })
-          .eq('id', position.id);
-        if (positionUpdateError) throw positionUpdateError;
-      } else {
-        const { error: positionInsertError } = await supabase.from('positions').insert({
-          user_id: input.userId,
-          symbol: input.symbol,
-          asset_class: input.assetClass,
-          qty: fill.filledQty,
-          avg_entry: fill.fillPrice,
-          realized_pnl: 0,
-        });
-        if (positionInsertError) throw positionInsertError;
-      }
-    } else if (openPosition) {
-      const remainingQty = Math.max(0, openPosition.qty - fill.filledQty);
-      const realizedPnl = openPosition.realized_pnl +
-        (fill.fillPrice - openPosition.avg_entry) * fill.filledQty;
-      const { error: positionUpdateError } = await supabase
+    if (existingPosition) {
+      const { error: updatePositionError } = await supabase
         .from('positions')
-        .update({
-          qty: remainingQty,
-          realized_pnl: realizedPnl,
-          closed_at: remainingQty <= 1e-8 ? new Date().toISOString() : null,
-        })
-        .eq('id', openPosition.id);
-      if (positionUpdateError) throw positionUpdateError;
+        .update(positionValues)
+        .eq('id', existingPosition.id);
+      if (updatePositionError) throw updatePositionError;
+    } else if (!closed) {
+      const { error: insertPositionError } = await supabase.from('positions').insert({
+        user_id: input.userId,
+        symbol: input.symbol,
+        asset_class: input.assetClass,
+        ...positionValues,
+      });
+      if (insertPositionError) throw insertPositionError;
     }
-  }
 
-  // Auto-journal entry
-  if (fill.filledQty > 0) {
-    const realizedPnl = input.side === 'sell' && openPosition
-      ? (fill.fillPrice - openPosition.avg_entry) * fill.filledQty
-      : null;
     const { error: journalError } = await supabase.from('journal').insert({
       user_id: input.userId,
       order_id: order.id,
@@ -226,16 +184,34 @@ export async function placeOrder({ supabase, input }: {
       side: input.side,
       qty: fill.filledQty,
       entry_price: fill.fillPrice,
-      pnl: realizedPnl,
+      pnl: closingQty > 0 ? realizedPnl : null,
       reason_entry: input.reasonEntry,
       emotional_state: 'calm',
     });
     if (journalError) throw journalError;
   }
 
-  // Update account
+  const { data: positions, error: positionsError } = await supabase
+    .from('positions')
+    .select('symbol, qty, avg_entry')
+    .eq('user_id', input.userId)
+    .is('closed_at', null);
+  if (positionsError) throw positionsError;
+
+  const totalMargin = (positions ?? []).reduce(
+    (total, position) => total + Math.abs(Number(position.qty) * Number(position.avg_entry)),
+    0
+  );
+  const unrealizedPnl = (positions ?? []).reduce((total, position) => {
+    const markPrice = position.symbol === input.symbol
+      ? fill.fillPrice
+      : input.marketPrices[position.symbol] ?? Number(position.avg_entry);
+    return total + (markPrice - Number(position.avg_entry)) * Number(position.qty);
+  }, 0);
+  const equity = newBalance + totalMargin + unrealizedPnl;
   const accountUpdate: {
     balance: number;
+    equity: number;
     total_fees_paid: number;
     total_trades: number;
     updated_at: string;
@@ -243,12 +219,13 @@ export async function placeOrder({ supabase, input }: {
     dead_until?: string;
   } = {
     balance: newBalance,
-    total_fees_paid: newFees,
+    equity,
+    total_fees_paid: Number(account.total_fees_paid ?? 0) + feeTotal,
     total_trades: Number(account.total_trades ?? 0) + 1,
     updated_at: new Date().toISOString(),
   };
 
-  if (newBalance <= 0) {
+  if (equity <= 0) {
     const deadUntil = new Date();
     deadUntil.setDate(deadUntil.getDate() + 7);
     accountUpdate.is_dead = true;
@@ -261,5 +238,5 @@ export async function placeOrder({ supabase, input }: {
     .eq('user_id', input.userId);
   if (updateError) throw updateError;
 
-  return { order, fill, newBalance };
+  return { order, fill, newBalance, realizedPnl };
 }
