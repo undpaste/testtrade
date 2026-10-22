@@ -99,6 +99,34 @@ export async function placeOrder({ supabase, input }: {
   };
 
   const fill = simulateFill(ctx);
+  let openPosition: {
+    id: string;
+    qty: number;
+    avg_entry: number;
+    realized_pnl: number;
+  } | null = null;
+
+  if (input.side === 'sell' && fill.filledQty > 0) {
+    const { data: position, error: positionError } = await supabase
+      .from('positions')
+      .select('id, qty, avg_entry, realized_pnl')
+      .eq('user_id', input.userId)
+      .eq('symbol', input.symbol)
+      .is('closed_at', null)
+      .maybeSingle();
+
+    if (positionError) throw positionError;
+    if (!position || Number(position.qty) + 1e-8 < fill.filledQty) {
+      throw new Error(`Not enough ${input.symbol} in your paper portfolio to sell that quantity.`);
+    }
+
+    openPosition = {
+      id: position.id,
+      qty: Number(position.qty),
+      avg_entry: Number(position.avg_entry),
+      realized_pnl: Number(position.realized_pnl ?? 0),
+    };
+  }
 
   // ============ UPDATE ACCOUNT ============
   const orderValue = fill.fillPrice * fill.filledQty;
@@ -137,8 +165,60 @@ export async function placeOrder({ supabase, input }: {
 
   if (orderErr) throw orderErr;
 
+  if (fill.filledQty > 0) {
+    if (input.side === 'buy') {
+      const { data: position, error: positionQueryError } = await supabase
+        .from('positions')
+        .select('id, qty, avg_entry, realized_pnl')
+        .eq('user_id', input.userId)
+        .eq('symbol', input.symbol)
+        .is('closed_at', null)
+        .maybeSingle();
+      if (positionQueryError) throw positionQueryError;
+
+      if (position) {
+        const oldQty = Number(position.qty);
+        const newQty = oldQty + fill.filledQty;
+        const avgEntry = (
+          oldQty * Number(position.avg_entry) + fill.filledQty * fill.fillPrice
+        ) / newQty;
+        const { error: positionUpdateError } = await supabase
+          .from('positions')
+          .update({ qty: newQty, avg_entry: avgEntry })
+          .eq('id', position.id);
+        if (positionUpdateError) throw positionUpdateError;
+      } else {
+        const { error: positionInsertError } = await supabase.from('positions').insert({
+          user_id: input.userId,
+          symbol: input.symbol,
+          asset_class: input.assetClass,
+          qty: fill.filledQty,
+          avg_entry: fill.fillPrice,
+          realized_pnl: 0,
+        });
+        if (positionInsertError) throw positionInsertError;
+      }
+    } else if (openPosition) {
+      const remainingQty = Math.max(0, openPosition.qty - fill.filledQty);
+      const realizedPnl = openPosition.realized_pnl +
+        (fill.fillPrice - openPosition.avg_entry) * fill.filledQty;
+      const { error: positionUpdateError } = await supabase
+        .from('positions')
+        .update({
+          qty: remainingQty,
+          realized_pnl: realizedPnl,
+          closed_at: remainingQty <= 1e-8 ? new Date().toISOString() : null,
+        })
+        .eq('id', openPosition.id);
+      if (positionUpdateError) throw positionUpdateError;
+    }
+  }
+
   // Auto-journal entry
   if (fill.filledQty > 0) {
+    const realizedPnl = input.side === 'sell' && openPosition
+      ? (fill.fillPrice - openPosition.avg_entry) * fill.filledQty
+      : null;
     const { error: journalError } = await supabase.from('journal').insert({
       user_id: input.userId,
       order_id: order.id,
@@ -146,6 +226,7 @@ export async function placeOrder({ supabase, input }: {
       side: input.side,
       qty: fill.filledQty,
       entry_price: fill.fillPrice,
+      pnl: realizedPnl,
       reason_entry: input.reasonEntry,
       emotional_state: 'calm',
     });
